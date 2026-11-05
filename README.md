@@ -136,8 +136,9 @@ curl "https://<your-username>--modal-image-upscaler-trigger-upscaler.modal.run?f
 | :--- | :--- | :--- | :--- |
 | `filename` | `string` | `null` | Optional file name to upscale specifically. |
 | `prefix` | `string` | `input/` | Custom input prefix/folder to scan. |
-| `delete_input` | `boolean` | `true` | Whether to delete the input image after successful upscale. |
+| `delete_input` | `boolean` | `true` | Whether to delete the input image after successful upscale (also cleans up redundant input if already in output). |
 | `tile_size` | `integer` | `0` | Tile size for splitting large images (e.g. `400` to prevent GPU memory errors on huge inputs). `0` = no tiling. |
+| `skip_existing` | `boolean` | `true` | Whether to skip upscaling if the target image already exists in the `output/` prefix. Saves GPU billing and time. |
 
 Example with options:
 ```bash
