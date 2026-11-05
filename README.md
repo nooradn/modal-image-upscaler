@@ -15,9 +15,9 @@ flowchart TD
     TriggerFn -->|"spawn() async workers"| UpscalerPool["Worker Pool (Parallel T4 GPUs)"]
     
     subgraph Modal GPU Workers
-        UpscalerPool --> Worker1["upscale_image_worker #1"]
-        UpscalerPool --> Worker2["upscale_image_worker #2"]
-        UpscalerPool --> WorkerN["upscale_image_worker #N"]
+        UpscalerPool --> Worker1["RealESRGANWorker #1 (In-VRAM Model)"]
+        UpscalerPool --> Worker2["RealESRGANWorker #2 (In-VRAM Model)"]
+        UpscalerPool --> WorkerN["RealESRGANWorker #N (In-VRAM Model)"]
     end
     
     Worker1 -->|"Download input"| R2
@@ -29,10 +29,11 @@ flowchart TD
 1. **Official Built-in Modal Secrets**: Sensitive R2/S3 credentials are managed securely via `modal.Secret.from_name("r2-credentials")` without hardcoding.
 2. **Dual-Container Optimization**:
    - `trigger_upscaler` runs on a minimal, ultra-fast CPU image for instantaneous web endpoint responses.
-   - `upscale_image_worker` runs on a CUDA-accelerated container with PyTorch and `RealESRGAN_x4plus` model weights pre-baked into `/root/weights` (zero cold-start download delay).
-3. **Two Modular Functions**:
+   - `RealESRGANWorker` runs on a CUDA-accelerated container with PyTorch and `RealESRGAN_x4plus` model pre-loaded into GPU VRAM using `@modal.enter()` and `scaledown_window=60`.
+3. **In-Memory GPU Inference (`modal.Cls`)**:
+   - Model weights are resident in GPU VRAM (FP16 half-precision), eliminating subprocess spawn overhead and re-initialization delays per task.
    - `trigger_upscaler`: Web endpoint (FastAPI) that scans the input folder (or handles a targeted image) and immediately dispatches workers asynchronously using `.spawn()`.
-   - `upscale_image_worker`: Dedicated T4 GPU worker that processes an image, writes to the output folder, deletes the source file, and frees disk space.
+   - `RealESRGANWorker.upscale_image`: Dedicated T4 GPU worker that processes an image directly in-memory, writes to the output folder, deletes the source file, and frees disk space.
 
 ---
 

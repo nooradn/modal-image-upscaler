@@ -1,7 +1,4 @@
-import glob
 import os
-import shutil
-import subprocess
 from typing import Optional
 
 import modal
@@ -18,7 +15,6 @@ storage_secret = modal.Secret.from_name(SECRET_NAME)
 WEIGHTS_DIR = "/root/weights"
 MODEL_NAME = "RealESRGAN_x4plus"
 MODEL_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
-INFERENCE_SCRIPT_URL = "https://raw.githubusercontent.com/xinntao/Real-ESRGAN/master/inference_realesrgan.py"
 SUPPORTED_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff")
 
 # ---------------------------------------------------------------------------
@@ -47,7 +43,6 @@ upscaler_image = (
     )
     .run_commands("pip install 'numpy<2' --force-reinstall")
     .run_commands(
-        f"wget {INFERENCE_SCRIPT_URL} -O /root/inference_realesrgan.py",
         f"mkdir -p {WEIGHTS_DIR} && wget {MODEL_URL} -O {WEIGHTS_DIR}/{MODEL_NAME}.pth",
     )
 )
@@ -119,105 +114,127 @@ def get_storage_config():
 
 
 # ---------------------------------------------------------------------------
-# FUNCTION 1: UPSCALER WORKER (GPU Serverless Function)
+# FUNCTION 1: UPSCALER WORKER CLASS (GPU Serverless Class with In-VRAM Model)
 # ---------------------------------------------------------------------------
-@app.function(
+@app.cls(
     image=upscaler_image,
     gpu="T4",
     timeout=600,
     cpu=2.0,
     memory=4096,
     secrets=[storage_secret],
+    scaledown_window=60,
 )
-def upscale_image_worker(
-    filename: str,
-    custom_input_prefix: Optional[str] = None,
-    custom_output_prefix: Optional[str] = None,
-    delete_input: bool = True,
-    tile_size: int = 0,
-) -> dict:
-    """
-    Downloads image from R2/S3, upscales with Real-ESRGAN x4plus on T4 GPU,
-    uploads high-resolution output back to R2/S3, and cleans up input.
-    """
-    s3 = make_s3_client()
-    bucket_name, default_input_prefix, default_output_prefix = get_storage_config()
+class RealESRGANWorker:
+    @modal.enter()
+    def setup(self):
+        """Loads Real-ESRGAN model into GPU VRAM once during container startup."""
+        import torch
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        from realesrgan import RealESRGANer
 
-    input_prefix = custom_input_prefix or default_input_prefix
-    output_prefix = custom_output_prefix or default_output_prefix
-    input_key = f"{input_prefix}{filename}"
-    output_key = f"{output_prefix}{filename}"
+        model_path = f"{WEIGHTS_DIR}/{MODEL_NAME}.pth"
+        print(f"[⚡] Preloading {MODEL_NAME} weights into GPU VRAM...")
 
-    local_in = f"/tmp/{filename}"
-    local_out_dir = f"/tmp/out_{os.path.splitext(filename)[0]}"
+        model = RRDBNet(
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=64,
+            num_block=23,
+            num_grow_ch=32,
+            scale=4,
+        )
+        use_half = torch.cuda.is_available()
 
-    if os.path.exists(local_out_dir):
-        shutil.rmtree(local_out_dir)
-    os.makedirs(local_out_dir, exist_ok=True)
+        self.upsampler = RealESRGANer(
+            scale=4,
+            model_path=model_path,
+            model=model,
+            tile=0,
+            tile_pad=10,
+            pre_pad=0,
+            half=use_half,
+            gpu_id=0 if torch.cuda.is_available() else None,
+        )
+        print(f"[✓] Model loaded into VRAM (half_precision={use_half}). Ready for requests.")
 
-    try:
-        print(f"[↓] Downloading: s3://{bucket_name}/{input_key}")
-        s3.download_file(bucket_name, input_key, local_in)
+    @modal.method()
+    def upscale_image(
+        self,
+        filename: str,
+        custom_input_prefix: Optional[str] = None,
+        custom_output_prefix: Optional[str] = None,
+        delete_input: bool = True,
+        tile_size: int = 0,
+    ) -> dict:
+        """
+        Downloads image from R2/S3, upscales directly in GPU VRAM without subprocess overhead,
+        uploads high-resolution output back to R2/S3, and cleans up input.
+        """
+        import cv2
 
-        model_weights_path = f"{WEIGHTS_DIR}/{MODEL_NAME}.pth"
-        cmd = [
-            "python3",
-            "/root/inference_realesrgan.py",
-            "-n",
-            MODEL_NAME,
-            "--model_path",
-            model_weights_path,
-            "-i",
-            local_in,
-            "-o",
-            local_out_dir,
-            "-s",
-            "4",
-            "--fp32",
-        ]
-        if tile_size > 0:
-            cmd.extend(["-t", str(tile_size)])
+        s3 = make_s3_client()
+        bucket_name, default_input_prefix, default_output_prefix = get_storage_config()
 
-        print(f"[⚙] Processing with {MODEL_NAME}: {filename}")
-        res = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        input_prefix = custom_input_prefix or default_input_prefix
+        output_prefix = custom_output_prefix or default_output_prefix
+        input_key = f"{input_prefix}{filename}"
+        output_key = f"{output_prefix}{filename}"
 
-        # Real-ESRGAN outputs upscaled file into local_out_dir
-        produced = glob.glob(os.path.join(local_out_dir, "*"))
-        if not produced:
-            raise FileNotFoundError(
-                f"Upscale script finished but no file generated. Stderr: {res.stderr}"
-            )
+        base_name = os.path.basename(filename)
+        local_in = f"/tmp/in_{base_name}"
+        local_out = f"/tmp/out_{base_name}"
 
-        local_output_path = produced[0]
+        try:
+            print(f"[↓] Downloading: s3://{bucket_name}/{input_key}")
+            s3.download_file(bucket_name, input_key, local_in)
 
-        print(f"[↑] Uploading high-res asset: s3://{bucket_name}/{output_key}")
-        s3.upload_file(local_output_path, bucket_name, output_key)
+            img = cv2.imread(local_in, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise ValueError(f"Failed to decode image at {local_in}")
 
-        if delete_input:
-            print(f"[✂] Cleaning up original input: s3://{bucket_name}/{input_key}")
-            s3.delete_object(Bucket=bucket_name, Key=input_key)
+            # Dynamic tiling control (prevents CUDA OOM on ultra-large images)
+            self.upsampler.tile_size = tile_size if tile_size > 0 else 0
 
-        print(f"[✓] Upscaling succeeded: {filename}")
-        return {
-            "status": "ok",
-            "file": filename,
-            "output_key": output_key,
-            "bucket": bucket_name,
-        }
+            print(f"[⚙] Processing with {MODEL_NAME} in GPU VRAM: {filename}")
+            output, _ = self.upsampler.enhance(img, outscale=4)
 
-    except Exception as e:
-        print(f"[✗] Error during upscaling of {filename}: {e}")
-        return {
-            "status": "failed",
-            "file": filename,
-            "error": str(e),
-        }
-    finally:
-        # Guarantee local temporary files are cleaned up
-        if os.path.exists(local_in):
-            os.remove(local_in)
-        if os.path.exists(local_out_dir):
-            shutil.rmtree(local_out_dir)
+            cv2.imwrite(local_out, output)
+
+            print(f"[↑] Uploading high-res asset: s3://{bucket_name}/{output_key}")
+            s3.upload_file(local_out, bucket_name, output_key)
+
+            if delete_input:
+                print(f"[✂] Cleaning up original input: s3://{bucket_name}/{input_key}")
+                s3.delete_object(Bucket=bucket_name, Key=input_key)
+
+            print(f"[✓] Upscaling succeeded: {filename}")
+            return {
+                "status": "ok",
+                "file": filename,
+                "output_key": output_key,
+                "bucket": bucket_name,
+            }
+
+        except Exception as e:
+            print(f"[✗] Error during upscaling of {filename}: {e}")
+            return {
+                "status": "failed",
+                "file": filename,
+                "error": str(e),
+            }
+        finally:
+            # Clean up local temporary files
+            if os.path.exists(local_in):
+                try:
+                    os.remove(local_in)
+                except Exception:
+                    pass
+            if os.path.exists(local_out):
+                try:
+                    os.remove(local_out)
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -244,11 +261,13 @@ def trigger_upscaler(
     bucket_name, default_input_prefix, default_output_prefix = get_storage_config()
     scan_prefix = prefix or default_input_prefix
 
+    worker = RealESRGANWorker()
+
     # Mode 1: Single specified target
     if filename:
         clean_filename = filename.removeprefix(scan_prefix)
         print(f"[🚀] Explicit target requested: {clean_filename}. Spawning upscaler...")
-        upscale_image_worker.spawn(
+        worker.upscale_image.spawn(
             filename=clean_filename,
             custom_input_prefix=scan_prefix,
             custom_output_prefix=default_output_prefix,
@@ -286,7 +305,7 @@ def trigger_upscaler(
 
     print(f"[🚀] Found {len(files)} target(s). Spawning workers...")
     for f in files:
-        upscale_image_worker.spawn(
+        worker.upscale_image.spawn(
             filename=f,
             custom_input_prefix=scan_prefix,
             custom_output_prefix=default_output_prefix,
